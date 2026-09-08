@@ -1,0 +1,54 @@
+# systemd unit for the trading bot.
+#
+#   sudo cp tradebot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now tradebot
+#   journalctl -u tradebot -f
+#
+# Adjust User, WorkingDirectory and the venv path to match your machine.
+
+[Unit]
+Description=tradebot — unattended Alpaca crypto trading bot
+Documentation=https://github.com/wavezone88/raptor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tradebot
+Group=tradebot
+WorkingDirectory=/opt/tradebot
+
+# Secrets. Must be chmod 600 and owned by the service user.
+EnvironmentFile=/opt/tradebot/.env
+
+ExecStart=/opt/tradebot/.venv/bin/python -m tradebot.main --json-logs
+
+# The bot holds positions. If it dies, restart it promptly and keep trying —
+# an unmanaged position is the thing we are protecting against.
+Restart=always
+RestartSec=15
+StartLimitIntervalSec=0
+
+# SIGTERM lets run_cycle() finish and persist state before the process goes.
+KillSignal=SIGTERM
+TimeoutStopSec=90
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tradebot
+
+# Hardening. The bot only needs to read its own directory and write state.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/opt/tradebot/state /opt/tradebot/data_cache /opt/tradebot/logs
+
+[Install]
+WantedBy=multi-user.target
