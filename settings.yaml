@@ -1,49 +1,65 @@
 # tradebot settings. Secrets live in .env, never here.
 # Every risk rule below is enforced in risk.py and covered by a test in
-# tests/test_risk.py. Changing a number here changes bot behaviour; removing a
-# rule from risk.py makes its test fail.
+# tests/test_risk.py. Removing a rule from risk.py makes its test fail.
+#
+# ASSET CLASS: Alpaca crypto (24/7). See README "Why crypto changes the rules"
+# for what this removes (PDT, settlement, market hours) and what it costs
+# (no bracket orders, higher fees, correlated universe).
 
 universe:
-  # Editable. Symbols are Alpaca-format (Berkshire class B is "BRK.B").
-  etfs: [SPY, QQQ, IWM]
-  # 20 largest S&P 500 constituents by market cap. This is a point-in-time
-  # snapshot taken when the project was scaffolded, NOT a live index feed —
-  # re-check it periodically or the universe will drift from reality.
-  equities:
-    - NVDA
-    - MSFT
-    - AAPL
-    - AMZN
-    - GOOGL
-    - META
-    - AVGO
-    - TSLA
-    - BRK.B
-    - JPM
-    - WMT
-    - LLY
-    - ORCL
-    - V
-    - MA
-    - NFLX
-    - XOM
-    - COST
-    - JNJ
-    - HD
-  # Used for the relative-strength ranking. Always fetched even if not traded.
-  benchmark: SPY
+  # Alpaca-listed USD crypto pairs. This is a point-in-time snapshot, NOT a
+  # live listing — set discover_from_broker to refresh it at startup.
+  # Stablecoins are deliberately absent: a 2-4% pullback in USDT/USD is a
+  # depeg, not a mean-reversion setup.
+  symbols:
+    - BTC/USD
+    - ETH/USD
+    - SOL/USD
+    - AVAX/USD
+    - LINK/USD
+    - LTC/USD
+    - BCH/USD
+    - DOT/USD
+    - UNI/USD
+    - AAVE/USD
+    - DOGE/USD
+    - SHIB/USD
+    - MKR/USD
+    - CRV/USD
+    - GRT/USD
+    - BAT/USD
+    - XTZ/USD
+    - SUSHI/USD
+    - YFI/USD
+    - PEPE/USD
+  # Ask Alpaca for the live tradable crypto list at startup and use that
+  # instead of the snapshot above. Falls back to the snapshot if the call
+  # fails, so a broker outage cannot empty the universe.
+  discover_from_broker: true
+  # Never trade these even if discovery returns them.
+  exclude:
+    - USDT/USD
+    - USDC/USD
+    - DAI/USD
+  # Relative-strength benchmark. BTC is crypto's index proxy the way SPY is
+  # equities'; ranking against it finds coins outperforming the complex.
+  benchmark: BTC/USD
 
 strategy:
+  # NOTE: these are the values from the original equity spec, kept deliberately
+  # unchanged. Crypto daily volatility is several times an equity index's, so a
+  # 4% stop is much closer to noise here. They have NOT been retuned to make
+  # the backtest look good — backtest.py reports what they actually do.
   trend_sma_days: 20            # close must be above this SMA (trend filter)
   pullback_lookback_days: 5     # "5-day high" window
   pullback_min_pct: 0.02        # entry band: 2%..4% below the 5-day high
   pullback_max_pct: 0.04
   volume_avg_days: 10           # today's volume must exceed this average
   volume_multiple: 1.0
-  rel_strength_lookback_days: 63  # ~3 months of trading days, for ranking
+  rel_strength_lookback_days: 90  # ~3 months; crypto trades every day, not 63
   stop_pct: 0.04                # exit: -4% from entry
   target_pct: 0.08              # exit: +8% from entry
-  time_stop_days: 5             # exit: after 5 trading days held
+  time_stop_days: 5             # exit: after 5 days held (all days are trading days)
 
 risk:
   starting_capital: 50.0        # reference equity; live equity comes from Alpaca
@@ -51,45 +67,62 @@ risk:
   max_position_pct_equity: 0.40 # no single position over 40% of equity
   risk_per_trade_pct: 0.01      # size = (equity * 1%) / stop_distance_pct
   stop_distance_pct: 0.04
-  daily_loss_limit_pct: 0.05    # -5% from session open -> flatten, halt to next session
-  weekly_loss_limit_pct: 0.10   # -10% from Monday open -> flatten, halt to next Monday
-  max_day_trades_in_5_business_days: 3  # refuse any order creating a 4th round trip
-  min_avg_volume_30d: 5000000   # liquidity floor
-  min_price: 10.0               # price floor
-  fractional_qty_decimals: 6    # rounding precision for fractional shares
+  daily_loss_limit_pct: 0.05    # -5% from the day's anchor -> flatten + halt
+  weekly_loss_limit_pct: 0.10   # -10% from Monday's anchor -> flatten + halt
+  # 24/7 markets have no session, so the loss anchors reset on this clock.
+  session_anchor_timezone: UTC
+  # Replaces the PDT guard, which does not apply to crypto. This is a churn and
+  # fee brake: at ~0.25%/side, 10 round trips a day is 5% of equity in fees.
+  max_round_trips_per_day: 3
+  # Crypto has no share count and no meaningful price floor (SHIB trades at
+  # $0.00002), so the equity liquidity filters become dollar volume.
+  min_avg_dollar_volume_30d: 10000000.0
+  min_price: 0.0                # disabled; kept so the rule stays configurable
+  fractional_qty_decimals: 8    # crypto is natively fractional
 
 execution:
   entry_limit_buffer_pct: 0.001 # entry limit = ask * (1 + buffer)
   cancel_unfilled_after_cycles: 2
-  # Alpaca rejects bracket orders for fractional quantities. When a risk-sized
-  # position is under one whole share we cannot attach an exchange-resident
-  # stop, so this decides what happens:
-  #   reject                 -> refuse the trade (safest; at $50 equity this
-  #                             means the bot will almost never trade)
-  #   allow_bot_managed_stop -> place a plain notional entry and enforce the
-  #                             stop from run_cycle(). THE STOP DIES WITH THE
-  #                             PROCESS. See README "Fractional shares".
-  fractional_policy: allow_bot_managed_stop
+  # Alpaca supports bracket/OCO orders for EQUITIES ONLY. Crypto accepts
+  # market, limit and stop-limit. There is therefore no way to attach an
+  # exchange-resident take-profit to a crypto entry.
+  #   exchange_stop_limit -> after a fill, rest a stop-limit sell at the stop.
+  #                          Survives process death. Target stays bot-managed.
+  #   bot_managed         -> both legs enforced from run_cycle() only.
+  #                          NOTHING protects you if the process dies.
+  stop_policy: exchange_stop_limit
+  # Stop-limit needs a limit below the trigger or it may not fill in a fast
+  # move. This is how far below the stop trigger the limit is placed.
+  stop_limit_slippage_pct: 0.005
+  # Minimum notional Alpaca will accept for a crypto order.
+  min_order_notional: 1.0
 
 schedule:
-  interval_minutes: 15          # run_cycle() cadence during market hours
-  pre_close_cancel_minutes: 5   # cancel unfilled entries this long before close
-  timezone: America/New_York    # for scheduling only; halts use Alpaca's clock
+  interval_minutes: 15          # run_cycle() cadence; crypto runs 24/7
+  timezone: UTC
+  # 24/7 means no close, so there is no pre-close cancel job. Unfilled entries
+  # are cancelled by the cancel_unfilled_after_cycles rule instead.
+  heartbeat_hours_utc: [0, 12]  # heartbeat alert at these UTC hours
 
 data:
   cache_dir: data_cache
   bar_timeframe: 1Day
-  # A bar older than interval_minutes * this multiple is stale -> cycle no-ops.
-  stale_bar_interval_multiple: 2.0
+  # Alpaca crypto market data is free and needs no subscription tier.
+  stale_quote_interval_multiple: 2.0
+  # 24/7 markets have no weekends or holidays, so a missing recent bar is a
+  # real outage, not a closed market. Much tighter than the equity equivalent.
+  max_bar_age_calendar_days: 2
 
 alerts:
   channel: discord
-  # Suppress duplicate identical alerts within this window (seconds).
   dedupe_window_seconds: 300
 
 backtest:
   years: 2
-  cost_per_side_pct: 0.0005     # 0.05% per side, for spread/slippage
+  # Alpaca crypto fees, lowest volume tier, taker side. The original spec
+  # assumed 0.05% (an equity spread estimate); crypto costs roughly 5x that,
+  # and the entry crosses the spread, so taker is the honest assumption.
+  cost_per_side_pct: 0.0025
   equity_curve_png: backtest_equity_curve.png
 
 state:

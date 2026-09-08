@@ -76,22 +76,36 @@ class Secrets(BaseSettings):
 
 
 class UniverseSettings(BaseModel):
-    etfs: list[str]
-    equities: list[str]
+    """Tradable crypto pairs. Alpaca uses BASE/QUOTE format, e.g. "BTC/USD"."""
+
+    symbols: list[str]
+    discover_from_broker: bool = True
+    exclude: list[str] = Field(default_factory=list)
     benchmark: str
 
     @property
-    def symbols(self) -> list[str]:
-        """Tradable universe, de-duplicated, order preserved."""
+    def excluded(self) -> set[str]:
+        return {s.upper() for s in self.exclude}
+
+    def resolve(self, discovered: list[str] | None = None) -> list[str]:
+        """Universe to trade, de-duplicated, exclusions applied, order kept.
+
+        `discovered` is Alpaca's live tradable list. Passing None (or an empty
+        list, i.e. a failed discovery call) falls back to the yaml snapshot so
+        a broker outage cannot silently empty the universe.
+        """
+        source = discovered if (self.discover_from_broker and discovered) else self.symbols
+        excluded = self.excluded
         seen: dict[str, None] = {}
-        for symbol in [*self.etfs, *self.equities]:
-            seen.setdefault(symbol.upper(), None)
+        for symbol in source:
+            upper = symbol.upper()
+            if upper not in excluded:
+                seen.setdefault(upper, None)
         return list(seen)
 
-    @property
-    def symbols_with_benchmark(self) -> list[str]:
-        """Everything we need bars for, including the ranking benchmark."""
-        symbols = self.symbols
+    def with_benchmark(self, symbols: list[str]) -> list[str]:
+        """Everything we need bars for. The benchmark is fetched even if the
+        exclusion list keeps it out of the tradable set."""
         benchmark = self.benchmark.upper()
         return symbols if benchmark in symbols else [*symbols, benchmark]
 
@@ -123,8 +137,11 @@ class RiskSettings(BaseModel):
     stop_distance_pct: float = Field(gt=0, lt=1)
     daily_loss_limit_pct: float = Field(gt=0, le=1)
     weekly_loss_limit_pct: float = Field(gt=0, le=1)
-    max_day_trades_in_5_business_days: int = Field(ge=0)
-    min_avg_volume_30d: float = Field(ge=0)
+    session_anchor_timezone: str = "UTC"
+    # Crypto is exempt from FINRA pattern-day-trader rules; this is the churn
+    # and fee brake that replaces that guard.
+    max_round_trips_per_day: int = Field(ge=0)
+    min_avg_dollar_volume_30d: float = Field(ge=0)
     min_price: float = Field(ge=0)
     fractional_qty_decimals: int = Field(ge=0, le=9)
 
@@ -132,19 +149,31 @@ class RiskSettings(BaseModel):
 class ExecutionSettings(BaseModel):
     entry_limit_buffer_pct: float = Field(ge=0)
     cancel_unfilled_after_cycles: int = Field(gt=0)
-    fractional_policy: Literal["reject", "allow_bot_managed_stop"]
+    # Alpaca has no bracket/OCO for crypto, so the stop is either a resting
+    # stop-limit or purely bot-managed. See settings.yaml for the tradeoff.
+    stop_policy: Literal["exchange_stop_limit", "bot_managed"]
+    stop_limit_slippage_pct: float = Field(ge=0)
+    min_order_notional: float = Field(gt=0)
 
 
 class ScheduleSettings(BaseModel):
     interval_minutes: int = Field(gt=0)
-    pre_close_cancel_minutes: int = Field(gt=0)
     timezone: str
+    heartbeat_hours_utc: list[int] = Field(default_factory=lambda: [0, 12])
+
+    @model_validator(mode="after")
+    def _check_hours(self) -> "ScheduleSettings":
+        bad = [h for h in self.heartbeat_hours_utc if not 0 <= h <= 23]
+        if bad:
+            raise ValueError(f"heartbeat_hours_utc must be 0..23, got {bad}")
+        return self
 
 
 class DataSettings(BaseModel):
     cache_dir: str
     bar_timeframe: str
-    stale_bar_interval_multiple: float = Field(gt=0)
+    stale_quote_interval_multiple: float = Field(gt=0)
+    max_bar_age_calendar_days: int = Field(gt=0)
 
 
 class AlertSettings(BaseModel):
