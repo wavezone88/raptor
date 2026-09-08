@@ -1,0 +1,28 @@
+# Secrets — never commit
+.env
+.env.local
+*.pem
+
+# Bot runtime state
+state/
+data_cache/
+logs/
+STOP
+*.parquet
+*.png
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
