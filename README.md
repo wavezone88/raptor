@@ -67,6 +67,35 @@ do rather than what a tuned version pretends to:
 
 These are honest defaults, not recommended ones. Revisit them using the backtest.
 
+#### The stop is switchable
+
+Because the flat stop is the most likely single cause of poor performance,
+`strategy.stop_mode` offers two options:
+
+| Mode | Stop | Target |
+|---|---|---|
+| `fixed_pct` (default) | −4% from entry | +8% from entry |
+| `atr_multiple` | 2 × ATR(14) below entry | 4 × ATR(14) above |
+
+Under `atr_multiple` the stop scales with each symbol's own volatility, so a
+quiet pair gets a tight stop and a violent one gets room. **Position sizing
+divides the risk budget by the actual distance to the stop**, so a wider stop
+buys proportionally less and risk per trade stays pinned at 1% either way.
+Levels are fixed when the position opens and persisted — a stop recomputed from
+a later ATR would let a losing position quietly widen its own risk.
+
+Compare them on your own data:
+
+```bash
+python -m tradebot.backtest --compare-stops
+```
+
+**Neither mode is tuned, and neither is recommended.** On synthetic bars
+`atr_multiple` cut the stop-out rate from 53.6% to 23.8% and turnover from 453
+trades to 340 — that mechanical effect is real, since a stop outside normal
+daily range gets hit less. Whether it makes the strategy profitable is a
+question only real data answers.
+
 ### 3. There are no bracket orders on crypto
 
 The original spec called for bracket orders so the stop rests at the exchange
@@ -149,8 +178,9 @@ live BTC/USD quote. If it fails, everything else will too.
 ## Running it
 
 ```bash
-python -m tradebot.backtest              # ALWAYS do this first
-python -m tradebot.backtest --synthetic  # pipeline check, no keys needed
+python -m tradebot.backtest                 # ALWAYS do this first
+python -m tradebot.backtest --compare-stops # fixed vs volatility-scaled stops
+python -m tradebot.backtest --synthetic     # pipeline check, no keys needed
 
 python -m tradebot.main --offline-demo   # a full cycle, fake broker, no keys
 python -m tradebot.main --once           # one real cycle against paper, then exit
@@ -261,7 +291,7 @@ passing).
 |---|---|
 | Max open positions | 3 |
 | Max single position | 40% of equity |
-| Position size | (equity × 1%) ÷ 4% stop, floored to 8 decimals |
+| Position size | (equity × 1%) ÷ **actual** stop distance, floored to 8 decimals |
 | Daily loss limit | −5% from the UTC-day anchor → flatten + halt to next UTC midnight |
 | Weekly loss limit | −10% from the Monday anchor → flatten + halt to next Monday |
 | Round trips per day | 3 (churn and fee brake) |
@@ -402,6 +432,9 @@ the code happens to be right today is not much of a test.
 ## Known limitations
 
 - **Not validated on real data.** See [Before you run this](#before-you-run-this).
+- **Neither stop mode is tuned.** `--compare-stops` is a measuring instrument;
+  picking a winner from one history is the parameter-fitting this project set
+  out to avoid.
 - **No take-profit at the exchange.** Alpaca has no crypto OCO.
 - **Universe is BTC-correlated**, so the 3-position cap diversifies less than it
   looks like it does.

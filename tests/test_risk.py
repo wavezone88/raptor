@@ -420,3 +420,67 @@ def test_next_utc_monday_from_a_monday_is_a_week_out():
     """Never returns today, or a halt would expire the instant it was set."""
     monday = datetime(2025, 6, 16, 9, 0, tzinfo=timezone.utc)
     assert next_utc_monday(monday) == datetime(2025, 6, 23, tzinfo=timezone.utc)
+
+
+# ------------------------------------------ sizing against the actual stop
+
+
+def test_position_size_uses_the_orders_real_stop_distance(risk_settings):
+    """Risk per trade must stay at 1% whatever the stop width. A wider stop
+    buys proportionally less, or ATR stops would silently multiply risk."""
+    tight = position_size(1_000.0, 100.0, risk_settings, stop_distance_pct=0.04)
+    wide = position_size(1_000.0, 100.0, risk_settings, stop_distance_pct=0.08)
+    assert tight * 100.0 == pytest.approx(250.0)
+    assert wide * 100.0 == pytest.approx(125.0)
+    # Dollars at risk are identical: 1% of equity either way.
+    assert tight * 100.0 * 0.04 == pytest.approx(wide * 100.0 * 0.08)
+
+
+def test_position_size_falls_back_to_configured_distance(risk_settings):
+    assert position_size(1_000.0, 100.0, risk_settings) == pytest.approx(
+        position_size(1_000.0, 100.0, risk_settings, stop_distance_pct=None)
+    )
+
+
+@pytest.mark.parametrize("bad", [0.0, -0.05])
+def test_position_size_ignores_a_nonsense_stop_distance(risk_settings, bad):
+    assert position_size(1_000.0, 100.0, risk_settings, stop_distance_pct=bad) * 100.0 == (
+        pytest.approx(250.0)
+    )
+
+
+def test_proposed_order_derives_its_stop_distance():
+    assert ProposedOrder("BTC/USD", "buy", 1.0, 100.0, "entry", stop_price=92.0).stop_distance_pct == (
+        pytest.approx(0.08)
+    )
+
+
+@pytest.mark.parametrize("stop", [None, 100.0, 120.0])
+def test_stop_distance_is_none_when_it_is_not_usable(stop):
+    """A stop at or above entry is not a stop; sizing must not divide by it."""
+    assert ProposedOrder("BTC/USD", "buy", 1.0, 100.0, "entry", stop_price=stop).stop_distance_pct is None
+
+
+def test_risk_check_sizes_an_atr_style_wide_stop_smaller(risk_settings):
+    """End to end through check(): the same equity buys less with a wider stop."""
+    manager = RiskManager(risk_settings)
+    state = account(equity=1_000.0, cash=1_000.0, day_anchor=1_000.0, week_anchor=1_000.0)
+
+    tight = manager.check(
+        ProposedOrder("BTC/USD", "buy", 100.0, 100.0, "entry", stop_price=96.0), state
+    )
+    wide = manager.check(
+        ProposedOrder("BTC/USD", "buy", 100.0, 100.0, "entry", stop_price=88.0), state
+    )
+    assert tight.approved and wide.approved
+    assert wide.order.qty < tight.order.qty
+
+
+def test_resizing_preserves_the_stop_price(risk_settings):
+    """A resized order must keep its stop, or the position loses its level."""
+    manager = RiskManager(risk_settings)
+    decision = manager.check(
+        ProposedOrder("BTC/USD", "buy", 999.0, 100.0, "entry", stop_price=96.0), account()
+    )
+    assert decision.resized
+    assert decision.order.stop_price == 96.0

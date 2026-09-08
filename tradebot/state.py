@@ -75,6 +75,10 @@ class PositionRecord:
     entry_price: float
     entry_date: str
     stop_order_id: str | None = None
+    # Fixed at entry and persisted, so a restart cannot recompute a drifting
+    # stop from a newer ATR.
+    stop_price: float | None = None
+    target_price: float | None = None
 
     def to_position(self) -> Position:
         import pandas as pd
@@ -84,6 +88,8 @@ class PositionRecord:
             qty=self.qty,
             entry_price=self.entry_price,
             entry_date=pd.Timestamp(self.entry_date),
+            stop_price=self.stop_price,
+            target_price=self.target_price,
         )
 
 
@@ -109,6 +115,11 @@ class BotState:
     cycle: int = 0
     last_cycle_at: str | None = None
     realized_pnl_today: float = 0.0
+
+    # Stop/target computed when an entry was SUBMITTED, held until the fill is
+    # seen by reconciliation. Without this the levels would be recomputed from
+    # a later bar's ATR, quietly moving the stop after the entry price was set.
+    pending_levels: dict[str, list[float]] = field(default_factory=dict)
 
     # ------------------------------------------------------------ persistence
 
@@ -139,6 +150,7 @@ class BotState:
             cycle=raw.get("cycle", 0),
             last_cycle_at=raw.get("last_cycle_at"),
             realized_pnl_today=raw.get("realized_pnl_today", 0.0),
+            pending_levels=raw.get("pending_levels", {}),
         )
         state.positions = {
             symbol: PositionRecord(**record)
@@ -223,14 +235,29 @@ class BotState:
         return [record.to_position() for record in self.positions.values()]
 
     def record_entry(
-        self, symbol: str, qty: float, entry_price: float, entry_date: datetime
+        self,
+        symbol: str,
+        qty: float,
+        entry_price: float,
+        entry_date: datetime,
+        stop_price: float | None = None,
+        target_price: float | None = None,
     ) -> None:
         self.positions[symbol] = PositionRecord(
             symbol=symbol,
             qty=qty,
             entry_price=entry_price,
             entry_date=entry_date.isoformat(),
+            stop_price=stop_price,
+            target_price=target_price,
         )
+
+    def take_pending_levels(self, symbol: str) -> tuple[float | None, float | None]:
+        """Pop the levels recorded when this symbol's entry was submitted."""
+        levels = self.pending_levels.pop(symbol, None)
+        if not levels or len(levels) != 2:
+            return None, None
+        return levels[0], levels[1]
 
     def record_exit(self, symbol: str, exit_price: float, now: datetime) -> float:
         """Remove a position and return its realized P&L."""

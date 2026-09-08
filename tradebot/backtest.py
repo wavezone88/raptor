@@ -43,7 +43,15 @@ from tradebot.risk import (
     next_utc_midnight,
     next_utc_monday,
 )
-from tradebot.strategy import Position, exit_signals, generate_signals, latest_candidates
+from tradebot.strategy import (
+    Position,
+    average_true_range,
+    exit_signals,
+    generate_signals,
+    latest_candidates,
+    stop_and_target_prices,
+    stop_distance_fraction,
+)
 
 log = get_logger(__name__)
 
@@ -158,6 +166,11 @@ def simulate(
     bars = bars.sort_index()
     signals = generate_signals(bars, settings.strategy, settings.universe.benchmark)
     dollar_volume = average_dollar_volume(bars, window=30)
+    atr = (
+        average_true_range(bars, settings.strategy.atr_period)
+        if settings.strategy.stop_mode == "atr_multiple"
+        else None
+    )
     tradable = set(settings.universe.resolve())
 
     timestamps = pd.DatetimeIndex(bars.index.get_level_values("timestamp").unique()).sort_values()
@@ -247,11 +260,31 @@ def simulate(
                 halted_until=halted_until,
                 now=timestamp.to_pydatetime(),
             )
+            # Levels are fixed here, at the fill, from the ATR available on
+            # this bar — the same information the live loop would have.
+            bar_atr = None
+            if atr is not None:
+                try:
+                    candidate = float(atr.loc[(symbol, timestamp)])
+                    bar_atr = candidate if candidate == candidate else None
+                except KeyError:
+                    bar_atr = None
+            stop_price, target_price = stop_and_target_prices(
+                price, settings.strategy, atr=bar_atr
+            )
+            distance = stop_distance_fraction(price, stop_price)
+
             # Ask for the full risk-sized amount; the manager decides the rest.
-            wanted = (equity * settings.risk.risk_per_trade_pct
-                      / settings.risk.stop_distance_pct) / price
+            wanted = (
+                equity
+                * settings.risk.risk_per_trade_pct
+                / (distance or settings.risk.stop_distance_pct)
+            ) / price
             decision = manager.check(
-                ProposedOrder(symbol, "buy", wanted, price, intent="entry"), state
+                ProposedOrder(
+                    symbol, "buy", wanted, price, intent="entry", stop_price=stop_price
+                ),
+                state,
             )
             if not decision.approved:
                 key = decision.reason.split(":", 1)[-1].strip()[:60]
@@ -263,7 +296,9 @@ def simulate(
             if total_cost > cash:
                 continue
             cash -= total_cost
-            positions[symbol] = Position(symbol, qty, price, timestamp)
+            positions[symbol] = Position(
+                symbol, qty, price, timestamp, stop_price=stop_price, target_price=target_price
+            )
             record_order(timestamp, symbol, qty, price, "buy", "entry")
         pending_entries = []
 
@@ -563,10 +598,87 @@ def verdict(net: SimulationResult, config: Config) -> str:
     )
 
 
+def compare_stop_modes(bars: pd.DataFrame, config: Config) -> str:
+    """Run both stop modes on identical bars and lay the results side by side.
+
+    This is a measuring instrument, not a recommendation. Picking the winner
+    from one history is exactly the parameter-fitting the project set out to
+    avoid — the comparison is only informative if the gap is large and holds up
+    over different date ranges.
+    """
+    cost = config.settings.backtest.cost_per_side_pct
+    capital = config.settings.risk.starting_capital
+    results: dict[str, SimulationResult] = {}
+
+    for mode in ("fixed_pct", "atr_multiple"):
+        variant = config.model_copy(deep=True)
+        variant.settings.strategy.stop_mode = mode
+        results[mode] = simulate(bars, variant, cost=cost)
+
+    rows = [
+        "=" * 74,
+        "STOP MODE COMPARISON (net of costs, identical bars)",
+        "=" * 74,
+        f"  {'':<24}{'fixed_pct':>16}{'atr_multiple':>16}",
+        "  " + "-" * 56,
+    ]
+
+    def line(label: str, fmt, extract) -> str:
+        values = []
+        for mode in ("fixed_pct", "atr_multiple"):
+            try:
+                values.append(fmt(extract(results[mode])))
+            except (ZeroDivisionError, IndexError, ValueError):
+                values.append("n/a")
+        return f"  {label:<24}{values[0]:>16}{values[1]:>16}"
+
+    def final(result: SimulationResult) -> float:
+        return float(result.equity_curve.iloc[-1]) if len(result.equity_curve) else capital
+
+    rows.append(line("Net return", lambda v: f"{v:.2%}", lambda r: final(r) / capital - 1.0))
+    rows.append(line("Ending equity", lambda v: f"${v:,.2f}", final))
+    rows.append(line("Max drawdown", lambda v: f"{v:.2%}", lambda r: max_drawdown(r.equity_curve)))
+    rows.append(line("Trades", lambda v: f"{v:d}", lambda r: len(r.trades)))
+    rows.append(
+        line("Win rate", lambda v: f"{v:.2%}", lambda r: trade_statistics(r.trades, cost)["win_rate"])
+    )
+    rows.append(
+        line(
+            "Expectancy/trade",
+            lambda v: f"{v:.3%}",
+            lambda r: trade_statistics(r.trades, cost)["expectancy"],
+        )
+    )
+    rows.append(
+        line(
+            "Stopped out",
+            lambda v: f"{v:.1%}",
+            lambda r: (
+                sum(1 for t in r.trades if t.reason == "stop") / len(r.trades)
+                if r.trades
+                else 0.0
+            ),
+        )
+    )
+    rows.append("=" * 74)
+    rows.append(
+        "  A lower 'stopped out' share under atr_multiple means the stop is\n"
+        "  sitting outside normal daily range instead of inside it. That is the\n"
+        "  mechanical effect being tested. It does not by itself make the\n"
+        "  strategy profitable."
+    )
+    return "\n".join(rows)
+
+
 # --------------------------------------------------------------------- main
 
 
-def run(years: int | None = None, synthetic: bool = False, settings_path: str | None = None) -> int:
+def run(
+    years: int | None = None,
+    synthetic: bool = False,
+    settings_path: str | None = None,
+    compare_stops: bool = False,
+) -> int:
     config = Config.load(settings_path) if settings_path else get_config()
     configure_logging(json_logs=False)
     years = years or config.settings.backtest.years
@@ -589,6 +701,16 @@ def run(years: int | None = None, synthetic: bool = False, settings_path: str | 
         rows=len(bars),
         symbols=bars.index.get_level_values("symbol").nunique(),
     )
+
+    if compare_stops:
+        print(compare_stop_modes(bars, config))
+        if synthetic:
+            print(
+                "\n  NOTE: synthetic bars. This compares the two modes' mechanics,\n"
+                "  not their profitability. Re-run on real data before concluding\n"
+                "  anything."
+            )
+        return 0
 
     net = simulate(bars, config)
     gross = simulate(bars, config, cost=0.0)
@@ -617,8 +739,18 @@ def cli() -> int:
         help="use deterministic generated bars instead of Alpaca (pipeline check only)",
     )
     parser.add_argument("--settings", default=None, help="path to an alternative settings.yaml")
+    parser.add_argument(
+        "--compare-stops",
+        action="store_true",
+        help="run fixed_pct and atr_multiple stop modes side by side on the same bars",
+    )
     args = parser.parse_args()
-    return run(years=args.years, synthetic=args.synthetic, settings_path=args.settings)
+    return run(
+        years=args.years,
+        synthetic=args.synthetic,
+        settings_path=args.settings,
+        compare_stops=args.compare_stops,
+    )
 
 
 if __name__ == "__main__":

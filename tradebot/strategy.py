@@ -41,12 +41,20 @@ SIGNAL_COLUMNS = [
 
 @dataclass(frozen=True)
 class Position:
-    """An open long position, as the bot understands it."""
+    """An open long position, as the bot understands it.
+
+    stop_price and target_price are fixed when the position is opened, not
+    recomputed each cycle. Under atr_multiple mode the ATR moves every bar, and
+    a stop that drifted with it would let a losing position quietly widen its
+    own risk.
+    """
 
     symbol: str
     qty: float
     entry_price: float
     entry_date: pd.Timestamp
+    stop_price: float | None = None
+    target_price: float | None = None
 
     def bars_held(self, as_of: pd.Timestamp, trading_days: pd.DatetimeIndex | None = None) -> int:
         """Trading days held. Uses the bar index when given, else calendar days."""
@@ -85,6 +93,33 @@ def _require_bar_columns(bars: pd.DataFrame) -> None:
         raise ValueError(f"bars missing required columns: {sorted(missing)}")
     if not isinstance(bars.index, pd.MultiIndex) or bars.index.nlevels != 2:
         raise ValueError("bars must have a (symbol, timestamp) MultiIndex")
+
+
+def average_true_range(bars: pd.DataFrame, period: int) -> pd.Series:
+    """Wilder's true range, simple-averaged over `period` bars, per symbol.
+
+    True range is the widest of: today's high-low, and the gap from the previous
+    close to today's high or low. It measures how far a symbol actually travels
+    in a bar, which is the number a stop should be sized against — a 4% stop
+    means something completely different on BTC than on a stablecoin pair.
+    """
+    high, low, close = bars["high"], bars["low"], bars["close"]
+    previous_close = close.groupby(level="symbol").shift(1)
+
+    ranges = pd.concat(
+        [
+            (high - low).rename("hl"),
+            (high - previous_close).abs().rename("hc"),
+            (low - previous_close).abs().rename("lc"),
+        ],
+        axis=1,
+    )
+    true_range = ranges.max(axis=1)
+    return (
+        true_range.groupby(level="symbol")
+        .transform(lambda s: s.rolling(period, min_periods=period).mean())
+        .rename("atr")
+    )
 
 
 def compute_relative_strength(
@@ -261,8 +296,14 @@ def exit_signals(
         bar = symbol_bars.iloc[-1]
         as_of = symbol_bars.index[-1]
 
-        stop_price = position.entry_price * (1.0 - settings.stop_pct)
-        target_price = position.entry_price * (1.0 + settings.target_pct)
+        # Levels fixed at entry win; fall back to computing them for a position
+        # adopted by reconciliation, which has no stored levels.
+        if position.stop_price is not None and position.target_price is not None:
+            stop_price, target_price = position.stop_price, position.target_price
+        else:
+            stop_price, target_price = stop_and_target_prices(
+                position.entry_price, settings
+            )
 
         if float(bar["low"]) <= stop_price:
             exits.append(
@@ -291,14 +332,35 @@ def exit_signals(
 
 
 def stop_and_target_prices(
-    entry_price: float, params: StrategySettings | None = None
+    entry_price: float,
+    params: StrategySettings | None = None,
+    atr: float | None = None,
 ) -> tuple[float, float]:
-    """Bracket legs for an entry. Shared by execution.py and the backtest."""
+    """Stop and target for an entry. Shared by execution.py and the backtest.
+
+    Under atr_multiple mode, `atr` is the symbol's ATR at entry. If it is
+    missing or unusable — too little history, a bad bar — this falls back to
+    the fixed percentage rather than returning no stop. Always having a stop
+    matters more than always having the preferred one.
+    """
     settings = _params(params)
+    if settings.stop_mode == "atr_multiple" and atr is not None and atr > 0 and np.isfinite(atr):
+        stop = entry_price - settings.atr_stop_multiple * atr
+        target = entry_price + settings.atr_target_multiple * atr
+        # An ATR wider than the entry price would imply a negative stop.
+        if stop > 0:
+            return stop, target
     return (
         entry_price * (1.0 - settings.stop_pct),
         entry_price * (1.0 + settings.target_pct),
     )
+
+
+def stop_distance_fraction(entry_price: float, stop_price: float) -> float:
+    """Stop distance as a fraction of entry — what position sizing divides by."""
+    if entry_price <= 0:
+        return 0.0
+    return max(0.0, (entry_price - stop_price) / entry_price)
 
 
 def is_adding_to_loser(

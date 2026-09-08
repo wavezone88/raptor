@@ -331,11 +331,14 @@ class ExecutionEngine:
             local = state.positions.get(symbol)
             if local is None:
                 report.adopted_positions.append(symbol)
+                stop_price, target_price = state.take_pending_levels(symbol)
                 state.record_entry(
                     symbol,
                     position.qty,
                     position.avg_entry_price,
                     datetime.now(timezone.utc),
+                    stop_price=stop_price,
+                    target_price=target_price,
                 )
             elif abs(local.qty - position.qty) > 1e-9:
                 report.qty_mismatches.append(
@@ -430,7 +433,13 @@ class ExecutionEngine:
     # --------------------------------------------------------------- stops
 
     def place_protective_stop(
-        self, symbol: str, qty: float, entry_price: float, state: BotState, cycle: int
+        self,
+        symbol: str,
+        qty: float,
+        entry_price: float,
+        state: BotState,
+        cycle: int,
+        stop_price: float | None = None,
     ) -> OrderRecord | None:
         """Rest a stop-limit sell at the exchange, if policy allows.
 
@@ -447,7 +456,10 @@ class ExecutionEngine:
             )
             return None
 
-        stop_price, _ = stop_and_target_prices(entry_price, self.config.settings.strategy)
+        # Use the level fixed at entry when we have one; only compute a fresh
+        # one for a position adopted by reconciliation.
+        if stop_price is None:
+            stop_price, _ = stop_and_target_prices(entry_price, self.config.settings.strategy)
         slippage = self.config.settings.execution.stop_limit_slippage_pct
         limit_price = stop_price * (1.0 - slippage)
         client_order_id = make_client_order_id(symbol, "sell", "stop", cycle)

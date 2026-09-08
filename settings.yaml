@@ -57,9 +57,25 @@ strategy:
   volume_avg_days: 10           # today's volume must exceed this average
   volume_multiple: 1.0
   rel_strength_lookback_days: 90  # ~3 months; crypto trades every day, not 63
-  stop_pct: 0.04                # exit: -4% from entry
-  target_pct: 0.08              # exit: +8% from entry
   time_stop_days: 5             # exit: after 5 days held (all days are trading days)
+
+  # HOW THE STOP AND TARGET ARE PLACED.
+  #   fixed_pct    -> stop_pct / target_pct below and above entry. The original
+  #                   equity spec. A flat 4% is close to noise on an asset that
+  #                   routinely moves 3-4% in a day.
+  #   atr_multiple -> stop at atr_stop_multiple x ATR below entry, target at
+  #                   atr_target_multiple x ATR above. The stop then scales with
+  #                   each symbol's own volatility, so a quiet pair gets a tight
+  #                   stop and a violent one gets room.
+  # Both are provided so the backtest can compare them on real data:
+  #   python -m tradebot.backtest --compare-stops
+  # Neither has been tuned. Do not pick one from a synthetic run.
+  stop_mode: fixed_pct
+  stop_pct: 0.04                # fixed_pct only: exit at -4% from entry
+  target_pct: 0.08              # fixed_pct only: exit at +8% from entry
+  atr_period: 14                # atr_multiple only: ATR lookback in bars
+  atr_stop_multiple: 2.0        # atr_multiple only: stop distance in ATRs
+  atr_target_multiple: 4.0      # atr_multiple only: keeps the same 1:2 R:R
 
 risk:
   starting_capital: 50.0        # reference equity; live equity comes from Alpaca

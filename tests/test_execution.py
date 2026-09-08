@@ -399,3 +399,53 @@ def test_flatten_continues_after_one_symbol_fails(config):
 def test_broker_symbols_are_normalised(raw, expected):
     """Alpaca reports crypto positions as BTCUSD but takes orders as BTC/USD."""
     assert AlpacaBroker._normalise(raw) == expected
+
+
+# ------------------------------------------------- levels fixed at entry
+
+
+def test_protective_stop_uses_the_level_fixed_at_entry(engine):
+    """Not a freshly computed one — a stop that drifts is not a stop."""
+    state = BotState()
+    state.record_entry("BTC/USD", 0.1, 100.0, NOW, stop_price=88.0, target_price=124.0)
+    engine.place_protective_stop(
+        "BTC/USD", 0.1, 100.0, state, cycle=1, stop_price=88.0
+    )
+    assert engine.broker.submitted[0]["stop_price"] == pytest.approx(88.0)
+
+
+def test_protective_stop_computes_a_level_for_an_adopted_position(engine):
+    """Reconciliation can adopt a position that has no stored levels."""
+    state = BotState()
+    engine.place_protective_stop("BTC/USD", 0.1, 100.0, state, cycle=1)
+    assert engine.broker.submitted[0]["stop_price"] == pytest.approx(96.0)
+
+
+def test_reconcile_applies_pending_levels_to_a_newly_filled_position(config):
+    """The gap between submitting an entry and seeing the fill must not lose
+    the stop that was computed when the order was priced."""
+    broker = FakeBroker(positions=[BrokerPosition("BTC/USD", 0.1, 100.0)])
+    engine = ExecutionEngine(broker, config)
+    state = BotState()
+    state.pending_levels["BTC/USD"] = [88.0, 124.0]
+
+    engine.reconcile(state)
+
+    assert state.positions["BTC/USD"].stop_price == 88.0
+    assert state.positions["BTC/USD"].target_price == 124.0
+    assert "BTC/USD" not in state.pending_levels, "levels should be consumed once applied"
+
+
+def test_position_levels_survive_a_state_round_trip(tmp_path):
+    """A restart must not forget where the stop was."""
+    path = tmp_path / "state.json"
+    state = BotState()
+    state.record_entry("BTC/USD", 0.1, 100.0, NOW, stop_price=88.0, target_price=124.0)
+    state.pending_levels["ETH/USD"] = [45.0, 60.0]
+    state.save(path)
+
+    restored = BotState.load(path)
+    assert restored.positions["BTC/USD"].stop_price == 88.0
+    assert restored.positions["BTC/USD"].target_price == 124.0
+    assert restored.pending_levels["ETH/USD"] == [45.0, 60.0]
+    assert restored.as_positions()[0].stop_price == 88.0

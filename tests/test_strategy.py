@@ -15,11 +15,13 @@ import pytest
 from tradebot.strategy import (
     ExitSignal,
     Position,
+    average_true_range,
     exit_signals,
     generate_signals,
     is_adding_to_loser,
     latest_candidates,
     stop_and_target_prices,
+    stop_distance_fraction,
 )
 
 from .conftest import START, bars_for_symbol, signalling_bars, stack, uptrend
@@ -306,3 +308,103 @@ def test_never_add_to_a_losing_position():
     assert is_adding_to_loser("ETH/USD", 95.0, held) is True
     assert is_adding_to_loser("ETH/USD", 105.0, held) is False
     assert is_adding_to_loser("SOL/USD", 1.0, held) is False
+
+
+# --------------------------------------------------- volatility-scaled stops
+
+
+def test_average_true_range_uses_the_widest_of_the_three_ranges(params):
+    """True range must account for gaps, not just the intrabar high-low."""
+    bars = stack(
+        ETH_USD=bars_for_symbol(
+            closes=[100.0, 120.0],
+            highs=[101.0, 121.0],
+            lows=[99.0, 119.0],
+        )
+    )
+    # Bar 2 gapped up: |high - previous close| = 21 beats high-low = 2.
+    atr = average_true_range(bars, period=1)
+    assert float(atr.iloc[-1]) == pytest.approx(21.0)
+
+
+def test_atr_is_undefined_until_the_window_fills(params):
+    bars = stack(ETH_USD=bars_for_symbol([100.0] * 5))
+    atr = average_true_range(bars, period=14)
+    assert atr.isna().all()
+
+
+def test_atr_scales_with_volatility(params):
+    """The whole point: a violent symbol gets a wider stop than a calm one."""
+    calm = bars_for_symbol([100.0] * 30, highs=[100.5] * 30, lows=[99.5] * 30)
+    wild = bars_for_symbol([100.0] * 30, highs=[110.0] * 30, lows=[90.0] * 30)
+    atr = average_true_range(stack(ETH_USD=calm, SOL_USD=wild), period=14)
+    assert float(atr.xs("SOL/USD", level="symbol").iloc[-1]) > (
+        float(atr.xs("ETH/USD", level="symbol").iloc[-1]) * 5
+    )
+
+
+def test_atr_mode_places_stop_at_the_configured_multiple(params):
+    atr_params = params.model_copy(
+        update={"stop_mode": "atr_multiple", "atr_stop_multiple": 2.0, "atr_target_multiple": 4.0}
+    )
+    stop, target = stop_and_target_prices(100.0, atr_params, atr=3.0)
+    assert stop == pytest.approx(94.0)
+    assert target == pytest.approx(112.0)
+
+
+@pytest.mark.parametrize("bad_atr", [None, float("nan"), 0.0, -1.0])
+def test_atr_mode_falls_back_to_fixed_when_atr_is_unusable(params, bad_atr):
+    """Always having a stop matters more than always having the preferred one."""
+    atr_params = params.model_copy(update={"stop_mode": "atr_multiple"})
+    stop, target = stop_and_target_prices(100.0, atr_params, atr=bad_atr)
+    assert stop == pytest.approx(96.0)
+    assert target == pytest.approx(108.0)
+
+
+def test_atr_mode_falls_back_when_the_stop_would_go_negative(params):
+    """An ATR wider than the price would imply a stop below zero."""
+    atr_params = params.model_copy(update={"stop_mode": "atr_multiple"})
+    stop, _ = stop_and_target_prices(10.0, atr_params, atr=500.0)
+    assert stop == pytest.approx(9.6)
+
+
+def test_fixed_mode_ignores_atr_entirely(params):
+    """Passing an ATR must not change behaviour while the mode is fixed_pct."""
+    assert stop_and_target_prices(100.0, params, atr=3.0) == stop_and_target_prices(100.0, params)
+
+
+def test_stop_distance_fraction():
+    assert stop_distance_fraction(100.0, 96.0) == pytest.approx(0.04)
+    assert stop_distance_fraction(100.0, 92.0) == pytest.approx(0.08)
+    assert stop_distance_fraction(0.0, 0.0) == 0.0
+
+
+# ------------------------------------------------- levels stored at entry
+
+
+def test_exit_uses_the_levels_fixed_at_entry_not_recomputed_ones(params):
+    """A stop that drifted with a later ATR would let a losing position widen
+    its own risk after the fact."""
+    held = Position(
+        symbol="ETH/USD",
+        qty=1.0,
+        entry_price=100.0,
+        entry_date=START,
+        stop_price=90.0,      # deliberately wider than the 4% default
+        target_price=120.0,
+    )
+    # -5%: would trip the default 4% stop, but not the stored 10% one.
+    bars = stack(ETH_USD=bars_for_symbol([100.0] * 4 + [95.0], lows=[100.0] * 4 + [95.0]))
+    assert exit_signals([held], bars, params) == []
+
+    deeper = stack(ETH_USD=bars_for_symbol([100.0] * 4 + [89.0], lows=[100.0] * 4 + [89.0]))
+    exits = exit_signals([held], deeper, params)
+    assert [e.reason for e in exits] == ["stop"]
+    assert exits[0].price == pytest.approx(90.0)
+
+
+def test_position_without_stored_levels_falls_back_to_config(params):
+    """A position adopted by reconciliation has no stored levels."""
+    adopted = Position("ETH/USD", 1.0, 100.0, START)
+    bars = stack(ETH_USD=bars_for_symbol([100.0] * 4 + [95.0], lows=[100.0] * 4 + [95.0]))
+    assert [e.reason for e in exit_signals([adopted], bars, params)] == ["stop"]

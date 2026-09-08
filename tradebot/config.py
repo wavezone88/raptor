@@ -121,11 +121,19 @@ class StrategySettings(BaseModel):
     stop_pct: float = Field(gt=0)
     target_pct: float = Field(gt=0)
     time_stop_days: int = Field(gt=0)
+    # See settings.yaml: fixed_pct is the original equity spec, atr_multiple
+    # scales the stop to each symbol's own volatility.
+    stop_mode: Literal["fixed_pct", "atr_multiple"] = "fixed_pct"
+    atr_period: int = Field(default=14, gt=0)
+    atr_stop_multiple: float = Field(default=2.0, gt=0)
+    atr_target_multiple: float = Field(default=4.0, gt=0)
 
     @model_validator(mode="after")
     def _check_band(self) -> "StrategySettings":
         if self.pullback_min_pct >= self.pullback_max_pct:
             raise ValueError("pullback_min_pct must be below pullback_max_pct")
+        if self.atr_target_multiple <= self.atr_stop_multiple:
+            raise ValueError("atr_target_multiple must exceed atr_stop_multiple")
         return self
 
 

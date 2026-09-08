@@ -38,7 +38,14 @@ from tradebot.execution import AlpacaBroker, ExecutionEngine, ExecutionError
 from tradebot.logging_setup import configure_logging, get_logger
 from tradebot.risk import AccountState, ProposedOrder, RiskManager, SymbolStats
 from tradebot.state import BotState
-from tradebot.strategy import exit_signals, generate_signals, latest_candidates
+from tradebot.strategy import (
+    average_true_range,
+    exit_signals,
+    generate_signals,
+    latest_candidates,
+    stop_and_target_prices,
+    stop_distance_fraction,
+)
 
 log = get_logger(__name__)
 
@@ -283,7 +290,12 @@ class TradingBot:
                 continue
             try:
                 self.execution.place_protective_stop(
-                    symbol, position.qty, position.entry_price, self.state, cycle
+                    symbol,
+                    position.qty,
+                    position.entry_price,
+                    self.state,
+                    cycle,
+                    stop_price=position.stop_price,
                 )
                 summary["actions"].append(f"placed protective stop {symbol}")
             except ExecutionError as exc:
@@ -302,6 +314,7 @@ class TradingBot:
         signals = generate_signals(
             bars, self.config.settings.strategy, self.config.settings.universe.benchmark
         )
+        atr_by_symbol = self._latest_atr(bars)
         candidates = latest_candidates(signals)
         if candidates.empty:
             log.info("cycle.no_candidates")
@@ -334,14 +347,21 @@ class TradingBot:
                 continue
 
             limit_price = self.execution.entry_limit_price(quote)
+            stop_price, target_price = stop_and_target_prices(
+                limit_price, self.config.settings.strategy, atr=atr_by_symbol.get(symbol)
+            )
+            distance = stop_distance_fraction(limit_price, stop_price)
             account_state = self._account_state(account, stats, now)
             sized = (
                 account_state.equity
                 * self.config.settings.risk.risk_per_trade_pct
-                / self.config.settings.risk.stop_distance_pct
+                / (distance or self.config.settings.risk.stop_distance_pct)
             ) / limit_price
             decision = self.risk.check(
-                ProposedOrder(symbol, "buy", sized, limit_price, intent="entry"), account_state
+                ProposedOrder(
+                    symbol, "buy", sized, limit_price, intent="entry", stop_price=stop_price
+                ),
+                account_state,
             )
             if not decision.approved:
                 log.info("cycle.entry_rejected", symbol=symbol, reason=decision.reason)
@@ -350,6 +370,7 @@ class TradingBot:
                 continue
             try:
                 self.execution.place_entry(decision.order, self.state, cycle)
+                self.state.pending_levels[symbol] = [stop_price, target_price]
                 self.alerter.trade(
                     symbol, "buy", decision.order.qty, decision.order.limit_price, "entry"
                 )
@@ -359,6 +380,22 @@ class TradingBot:
             except ExecutionError as exc:
                 log.error("cycle.entry_failed", symbol=symbol, error=str(exc))
                 summary["errors"].append(f"entry failed {symbol}: {exc}")
+
+    def _latest_atr(self, bars: pd.DataFrame) -> dict[str, float]:
+        """Each symbol's ATR on the most recent bar, for stop placement."""
+        if self.config.settings.strategy.stop_mode != "atr_multiple" or bars.empty:
+            return {}
+        series = average_true_range(bars, self.config.settings.strategy.atr_period)
+        latest = bars.index.get_level_values("timestamp").max()
+        result: dict[str, float] = {}
+        for symbol in dict.fromkeys(bars.index.get_level_values("symbol")):
+            try:
+                value = float(series.loc[(symbol, latest)])
+            except KeyError:
+                continue
+            if value > 0 and value == value:  # finite, not NaN
+                result[symbol] = value
+        return result
 
     def _maybe_heartbeat(self, account, now: datetime) -> None:
         hours = self.config.settings.schedule.heartbeat_hours_utc

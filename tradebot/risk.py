@@ -50,13 +50,26 @@ class ProposedOrder:
     qty: float
     limit_price: float
     intent: str = ""          # "entry", "stop", "target", "time_stop", "flatten"
+    # The stop this entry will be protected by. Sizing divides the risk budget
+    # by the ACTUAL distance to it, so a wider ATR stop buys proportionally
+    # less. Without this an ATR stop would silently multiply risk per trade.
+    stop_price: float | None = None
 
     @property
     def notional(self) -> float:
         return self.qty * self.limit_price
 
+    @property
+    def stop_distance_pct(self) -> float | None:
+        if self.stop_price is None or self.limit_price <= 0:
+            return None
+        distance = (self.limit_price - self.stop_price) / self.limit_price
+        return distance if distance > 0 else None
+
     def resized_to(self, qty: float) -> "ProposedOrder":
-        return ProposedOrder(self.symbol, self.side, qty, self.limit_price, self.intent)
+        return ProposedOrder(
+            self.symbol, self.side, qty, self.limit_price, self.intent, self.stop_price
+        )
 
 
 @dataclass(frozen=True)
@@ -147,20 +160,28 @@ def position_size(
     price: float,
     settings: RiskSettings,
     available_cash: float | None = None,
+    stop_distance_pct: float | None = None,
 ) -> float:
     """Units to buy: (equity x risk%) / stop distance, then capped.
 
     Caps, in order:
-      1. risk budget    — equity * risk_per_trade_pct / stop_distance_pct
+      1. risk budget    — equity * risk_per_trade_pct / stop distance
       2. concentration  — equity * max_position_pct_equity
       3. cash on hand   — crypto is non-marginable, so cash is the hard ceiling
+
+    `stop_distance_pct` is the ACTUAL distance to this order's stop. Under
+    atr_multiple mode it varies per symbol, and using the configured default
+    instead would size every trade as though its stop were 4% away — turning a
+    wider stop into proportionally more risk, which is the opposite of the
+    point. Falls back to the configured default when not supplied.
 
     Rounded down to fractional precision.
     """
     if price <= 0 or equity <= 0:
         return 0.0
+    distance = stop_distance_pct if stop_distance_pct and stop_distance_pct > 0 else settings.stop_distance_pct
     risk_budget = equity * settings.risk_per_trade_pct
-    notional = risk_budget / settings.stop_distance_pct
+    notional = risk_budget / distance
     notional = min(notional, equity * settings.max_position_pct_equity)
     if available_cash is not None:
         notional = min(notional, max(0.0, available_cash))
@@ -302,7 +323,13 @@ class RiskManager:
                 f"buying_power={state.buying_power:.2f})"
             )
 
-        allowed_qty = position_size(state.equity, order.limit_price, self.settings, available)
+        allowed_qty = position_size(
+            state.equity,
+            order.limit_price,
+            self.settings,
+            available,
+            stop_distance_pct=order.stop_distance_pct,
+        )
         if allowed_qty <= 0:
             return RiskDecision.reject(
                 f"{order.symbol}: sized to zero at price {order.limit_price:.6g} "
